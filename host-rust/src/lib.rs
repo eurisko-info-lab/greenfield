@@ -1,5 +1,6 @@
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const MAX_DEPTH: usize = 64;
 pub type Digest = [u8; 32];
@@ -91,6 +92,12 @@ pub struct CasStore {
     entries: HashMap<Digest, Vec<u8>>,
 }
 
+static GLOBAL_CAS: OnceLock<Mutex<HashMap<Digest, Vec<u8>>>> = OnceLock::new();
+
+fn global_cas() -> &'static Mutex<HashMap<Digest, Vec<u8>>> {
+    GLOBAL_CAS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 impl CasStore {
     pub fn put(&mut self, bytes: &[u8]) -> Digest {
         let digest = digest_bytes(bytes);
@@ -104,13 +111,448 @@ impl CasStore {
 }
 
 pub fn cas_put(bytes: &[u8]) -> Digest {
-    let mut store = CasStore::default();
-    store.put(bytes)
+    let digest = digest_bytes(bytes);
+    let mut store = global_cas().lock().unwrap();
+    store.insert(digest, bytes.to_vec());
+    digest
 }
 
 pub fn cas_get(digest: Digest) -> Option<Vec<u8>> {
-    let store = CasStore::default();
-    store.get(digest)
+    let store = global_cas().lock().unwrap();
+    store.get(&digest).cloned()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeDescription {
+    Unit,
+    Bool,
+    Nat,
+    Bytes,
+    Text,
+    Digest,
+    Sum(Box<TypeDescription>, Box<TypeDescription>),
+    Product(Vec<TypeDescription>),
+    Sequence(Box<TypeDescription>),
+    FiniteMap(Box<TypeDescription>, Box<TypeDescription>),
+    Ref,
+    Arrow(Box<TypeDescription>, Box<TypeDescription>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypedNode {
+    pub type_digest: Digest,
+    pub value: Value,
+}
+
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Graph {
+    entries: HashMap<Digest, TypedNode>,
+}
+
+impl Graph {
+    pub fn insert(&mut self, value: Value, type_digest: Digest) -> Digest {
+        let node = TypedNode { type_digest, value };
+        let digest = digest_bytes(&encode_value(&node.value).unwrap_or_default());
+        self.entries.insert(digest, node);
+        digest
+    }
+
+    pub fn get(&self, digest: Digest) -> Option<&TypedNode> {
+        self.entries.get(&digest)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphError {
+    MissingDigest(Digest),
+    TypeMismatch,
+    InvalidRef,
+    InvalidType,
+    MissingType,
+    Conflict,
+    Unexpected(String),
+}
+
+pub fn type_digest_for_value(value: &Value) -> Digest {
+    let bytes = match value {
+        Value::Unit => b"unit".to_vec(),
+        Value::Bool(_) => b"bool".to_vec(),
+        Value::Nat(_) => b"nat".to_vec(),
+        Value::Bytes(_) => b"bytes".to_vec(),
+        Value::Text(_) => b"text".to_vec(),
+        Value::Sum(_, _) => b"sum".to_vec(),
+        Value::Product(_) => b"product".to_vec(),
+        Value::Sequence(_) => b"sequence".to_vec(),
+        Value::FiniteMap(_) => b"finitemap".to_vec(),
+        Value::Digest(_) => b"digest".to_vec(),
+        Value::Ref { .. } => b"ref".to_vec(),
+    };
+    digest_bytes(&bytes)
+}
+
+pub fn check_type(value: &Value, ty: &TypeDescription, graph: &Graph) -> Result<(), GraphError> {
+    match (value, ty) {
+        (Value::Unit, TypeDescription::Unit) => Ok(()),
+        (Value::Bool(_), TypeDescription::Bool) => Ok(()),
+        (Value::Nat(_), TypeDescription::Nat) => Ok(()),
+        (Value::Bytes(_), TypeDescription::Bytes) => Ok(()),
+        (Value::Text(_), TypeDescription::Text) => Ok(()),
+        (Value::Digest(_), TypeDescription::Digest) => Ok(()),
+        (Value::Sum(_, payload), TypeDescription::Sum(t1, t2)) => {
+            check_type(payload, t2, graph).and_then(|_| check_type(&Value::Unit, t1, graph))
+        }
+        (Value::Product(items), TypeDescription::Product(tys)) if items.len() == tys.len() => {
+            for (item, ty_item) in items.iter().zip(tys.iter()) {
+                check_type(item, ty_item, graph)?;
+            }
+            Ok(())
+        }
+        (Value::Sequence(items), TypeDescription::Sequence(ty_item)) => {
+            for item in items { check_type(item, ty_item, graph)?; }
+            Ok(())
+        }
+        (Value::FiniteMap(entries), TypeDescription::FiniteMap(key_ty, value_ty)) => {
+            for (key, value) in entries {
+                check_type(key, key_ty, graph)?;
+                check_type(value, value_ty, graph)?;
+            }
+            Ok(())
+        }
+        (Value::Ref { digest, type_digest }, TypeDescription::Ref) => {
+            if graph.get(*digest).is_none() { return Err(GraphError::MissingDigest(*digest)); }
+            if graph.get(*digest).map(|node| node.type_digest) != Some(*type_digest) { return Err(GraphError::TypeMismatch); }
+            Ok(())
+        }
+        (Value::Ref { digest, type_digest }, _) => {
+            let node = graph.get(*digest).ok_or(GraphError::MissingDigest(*digest))?;
+            if node.type_digest != *type_digest { return Err(GraphError::TypeMismatch); }
+            Ok(())
+        }
+        _ => Err(GraphError::TypeMismatch),
+    }
+}
+
+pub fn close(graph: &Graph, root_digest: Digest) -> Result<Vec<Digest>, GraphError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![root_digest];
+    let mut out = Vec::new();
+    while let Some(digest) = stack.pop() {
+        if !seen.insert(digest) { continue; }
+        out.push(digest);
+        let node = graph.get(digest).ok_or(GraphError::MissingDigest(digest))?;
+        if let Value::Ref { digest: child_digest, type_digest } = &node.value {
+            stack.push(*child_digest);
+            if graph.get(*child_digest).map(|n| n.type_digest) != Some(*type_digest) {
+                return Err(GraphError::TypeMismatch);
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn traverse(graph: &Graph, closure: &[Digest], path: &[usize]) -> Result<Value, GraphError> {
+    let digest = closure.get(path[0]).copied().ok_or(GraphError::Unexpected("empty path".to_string()))?;
+    let node = graph.get(digest).ok_or(GraphError::MissingDigest(digest))?;
+    if path.len() == 1 { return Ok(node.value.clone()); }
+    match &node.value {
+        Value::Ref { digest: child_digest, .. } => {
+            let index = closure.iter().position(|d| d == child_digest).ok_or(GraphError::MissingDigest(*child_digest))?;
+            traverse(graph, closure, &[index])
+        }
+        _ => Err(GraphError::Unexpected("non-ref traversal".to_string())),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Arrow {
+    pub input_type: TypeDescription,
+    pub output_type: TypeDescription,
+    pub core_module: CoreModule,
+    pub function_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lens {
+    pub source_type: TypeDescription,
+    pub view_type: TypeDescription,
+    pub get_arrow: Arrow,
+    pub modify_arrow: Arrow,
+}
+
+pub fn run_arrow(arrow: &Arrow, input: Value) -> Verdict {
+    eval_core(&arrow.core_module, arrow.function_index, vec![input])
+}
+
+pub fn run_lens_get(lens: &Lens, input: Value) -> Verdict {
+    run_arrow(&lens.get_arrow, input)
+}
+
+pub fn run_lens_modify(lens: &Lens, input: Value, new_view: Value) -> Verdict {
+    let payload = Value::Product(vec![input, new_view]);
+    run_arrow(&lens.modify_arrow, payload)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccelManifest {
+    pub semantic_arrow: Arrow,
+    pub source_closure_digest: Digest,
+    pub target_kind: String,
+    pub implementation_digest: Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccelBinding {
+    pub manifest_digest: Digest,
+    pub credential_digest: Option<Digest>,
+}
+
+type AccelHandler = Arc<dyn Fn(Value, &Budget) -> Verdict + Send + Sync>;
+
+static ACCEL_REGISTRY: OnceLock<Mutex<HashMap<Digest, AccelHandler>>> = OnceLock::new();
+
+pub fn accel_register(implementation_digest: Digest, implementation: AccelHandler) {
+    let mut registry = ACCEL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    registry.insert(implementation_digest, implementation);
+}
+
+pub fn accel_run(manifest: &AccelManifest, input: Value, budget: Budget) -> Verdict {
+    let registry = ACCEL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let implementation = registry.lock().unwrap().get(&manifest.implementation_digest).cloned();
+    match implementation {
+        Some(handler) => handler(input, &budget),
+        None => run_arrow(&manifest.semantic_arrow, input),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delta {
+    Zero,
+    Replace(Value),
+    Product(Vec<Delta>),
+    Sum { tag: u64, delta: Box<Delta> },
+    Sequence { index: usize, value: Value },
+    MapInsert { key: Value, value: Value },
+    MapRemove(Value),
+    BytesAppend(Vec<u8>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeltaError {
+    TypeMismatch,
+    NotComposable,
+    InvalidIndex,
+    Unsupported(String),
+}
+
+pub fn zero_for_type(ty: &TypeDescription) -> Delta {
+    match ty {
+        TypeDescription::Unit => Delta::Zero,
+        TypeDescription::Bool => Delta::Zero,
+        TypeDescription::Nat => Delta::Zero,
+        TypeDescription::Bytes => Delta::Zero,
+        TypeDescription::Text => Delta::Zero,
+        TypeDescription::Digest => Delta::Zero,
+        TypeDescription::Product(_) => Delta::Product(Vec::new()),
+        TypeDescription::Sequence(_) => Delta::Zero,
+        TypeDescription::FiniteMap(_, _) => Delta::Zero,
+        TypeDescription::Ref => Delta::Zero,
+        TypeDescription::Arrow(_, _) => Delta::Zero,
+        TypeDescription::Sum(_, _) => Delta::Zero,
+    }
+}
+
+pub fn apply_delta(ty: &TypeDescription, value: &Value, delta: &Delta) -> Result<Value, DeltaError> {
+    match (ty, value, delta) {
+        (_, _, Delta::Zero) => Ok(value.clone()),
+        (_, _, Delta::Replace(next)) => Ok(next.clone()),
+        (TypeDescription::Product(types), Value::Product(items), Delta::Product(deltas)) if items.len() == types.len() && deltas.len() == types.len() => {
+            let mut out = Vec::new();
+            for ((item, ty), delta) in items.iter().zip(types.iter()).zip(deltas.iter()) {
+                out.push(apply_delta(ty, item, delta)?);
+            }
+            Ok(Value::Product(out))
+        }
+        (TypeDescription::Sum(_, payload_ty), Value::Sum(tag, payload), Delta::Sum { tag: new_tag, delta }) if *tag == *new_tag => {
+            let next = apply_delta(payload_ty, payload, delta)?;
+            Ok(Value::Sum(*tag, Box::new(next)))
+        }
+        (TypeDescription::Sequence(_), Value::Sequence(items), Delta::Sequence { index, value: replacement }) if *index < items.len() => {
+            let mut next = items.clone();
+            next[*index] = replacement.clone();
+            Ok(Value::Sequence(next))
+        }
+        (TypeDescription::FiniteMap(_, _), Value::FiniteMap(entries), Delta::MapInsert { key, value }) => {
+            let mut next = entries.clone();
+            if let Some(position) = next.iter().position(|(existing, _)| existing == key) {
+                next[position].1 = value.clone();
+            } else {
+                next.push((key.clone(), value.clone()));
+            }
+            Ok(Value::FiniteMap(next))
+        }
+        (TypeDescription::FiniteMap(_, _), Value::FiniteMap(entries), Delta::MapRemove(key)) => {
+            let next = entries.iter().filter(|(existing, _)| existing != key).cloned().collect();
+            Ok(Value::FiniteMap(next))
+        }
+        (TypeDescription::Bytes, Value::Bytes(bytes), Delta::BytesAppend(extra)) => {
+            let mut next = bytes.clone();
+            next.extend(extra.iter().copied());
+            Ok(Value::Bytes(next))
+        }
+        _ => Err(DeltaError::TypeMismatch),
+    }
+}
+
+pub fn diff_delta(ty: &TypeDescription, before: &Value, after: &Value) -> Result<Delta, DeltaError> {
+    if before == after {
+        return Ok(Delta::Zero);
+    }
+    match (ty, before, after) {
+        (TypeDescription::Product(types), Value::Product(before_items), Value::Product(after_items)) if before_items.len() == after_items.len() && before_items.len() == types.len() => {
+            let deltas = before_items
+                .iter()
+                .zip(after_items.iter())
+                .zip(types.iter())
+                .map(|((b, a), t)| diff_delta(t, b, a))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Delta::Product(deltas))
+        }
+        (TypeDescription::Sum(_, _), Value::Sum(tag_before, before_payload), Value::Sum(tag_after, after_payload)) if tag_before == tag_after => {
+            let inner = diff_delta(&TypeDescription::Unit, before_payload, after_payload)?;
+            Ok(Delta::Sum { tag: *tag_before, delta: Box::new(inner) })
+        }
+        (TypeDescription::Sequence(_), Value::Sequence(before_items), Value::Sequence(after_items)) if before_items.len() == after_items.len() => {
+            let deltas = before_items.iter().zip(after_items.iter()).enumerate().map(|(idx, (_, a))| Delta::Sequence { index: idx, value: a.clone() }).collect();
+            Ok(Delta::Product(deltas))
+        }
+        (TypeDescription::FiniteMap(_, _), Value::FiniteMap(before_entries), Value::FiniteMap(after_entries)) => {
+            let mut result = Vec::new();
+            for (key, value) in after_entries.iter() {
+                if !before_entries.iter().any(|(existing, _)| existing == key) || before_entries.iter().find(|(existing, _)| existing == key).map(|(_, old)| old) != Some(value) {
+                    result.push(Delta::MapInsert { key: key.clone(), value: value.clone() });
+                }
+            }
+            for (key, _) in before_entries.iter() {
+                if !after_entries.iter().any(|(existing, _)| existing == key) {
+                    result.push(Delta::MapRemove(key.clone()));
+                }
+            }
+            if result.is_empty() { Ok(Delta::Zero) } else { Ok(Delta::Product(result)) }
+        }
+        _ => Ok(Delta::Replace(after.clone())),
+    }
+}
+
+pub fn compose_delta(ty: &TypeDescription, left: &Delta, right: &Delta) -> Result<Delta, DeltaError> {
+    match (left, right) {
+        (Delta::Zero, _) => Ok(right.clone()),
+        (_, Delta::Zero) => Ok(left.clone()),
+        (Delta::Replace(_), Delta::Replace(after)) => Ok(Delta::Replace(after.clone())),
+        (Delta::Product(xs), Delta::Product(ys)) => {
+            let mut out = Vec::new();
+            for (x, y) in xs.iter().zip(ys.iter()) { out.push(compose_delta(ty, x, y)?); }
+            Ok(Delta::Product(out))
+        }
+        _ => Ok(Delta::Replace(match right {
+            Delta::Replace(value) => value.clone(),
+            _ => match value_for_delta(right) { Some(value) => value, None => Value::Unit },
+        })),
+    }
+}
+
+fn value_for_delta(delta: &Delta) -> Option<Value> {
+    match delta {
+        Delta::Replace(value) => Some(value.clone()),
+        Delta::Sequence { value, .. } => Some(value.clone()),
+        Delta::MapInsert { value, .. } => Some(value.clone()),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Operation {
+    Noop,
+    SetNat(u64),
+    AddNat(u64),
+    SetText(String),
+    MapInsert { key: Value, value: Value },
+    SequencePush(Value),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperationLanguage {
+    pub operation_type: TypeDescription,
+    pub state_type: TypeDescription,
+}
+
+pub fn elaborate_operation(language: &OperationLanguage, state: &Value, operation: &Operation) -> Result<Delta, DeltaError> {
+    match (language.state_type.clone(), state, operation) {
+        (TypeDescription::Nat, _, Operation::SetNat(value)) => Ok(Delta::Replace(Value::Nat(*value))),
+        (TypeDescription::Nat, Value::Nat(current), Operation::AddNat(delta)) => Ok(Delta::Replace(Value::Nat(current.saturating_add(*delta)))),
+        (TypeDescription::Text, _, Operation::SetText(value)) => Ok(Delta::Replace(Value::Text(value.clone()))),
+        (TypeDescription::FiniteMap(_, _), Value::FiniteMap(_), Operation::MapInsert { key, value }) => Ok(Delta::MapInsert { key: key.clone(), value: value.clone() }),
+        (TypeDescription::Sequence(_), Value::Sequence(_), Operation::SequencePush(value)) => Ok(Delta::Sequence { index: 0, value: value.clone() }),
+        _ => Err(DeltaError::Unsupported("operation not supported for state type".to_string())),
+    }
+}
+
+pub fn reachable(genesis: &Value, operations: &[Operation], depth: usize) -> Result<Vec<Value>, DeltaError> {
+    let mut current = genesis.clone();
+    let mut states = vec![current.clone()];
+    for op in operations.iter().take(depth) {
+        let language = OperationLanguage {
+            operation_type: TypeDescription::Nat,
+            state_type: TypeDescription::Nat,
+        };
+        let next = apply_delta(&language.state_type, &current, &elaborate_operation(&language, &current, op)?)?;
+        states.push(next.clone());
+        current = next;
+    }
+    Ok(states)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpNode {
+    pub language_digest: Digest,
+    pub operation_digest: Digest,
+    pub dependencies: Vec<Digest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct History {
+    pub nodes: Vec<OpNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Materialization {
+    pub genesis_digest: Digest,
+    pub frontier: Vec<Digest>,
+    pub state_digest: Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Conflict {
+    pub nodes: Vec<Digest>,
+}
+
+pub fn frontier(history: &History) -> Vec<Digest> {
+    history.nodes.iter().map(|node| digest_bytes(&encode_value(&Value::Text(format!("{:?}", node))).unwrap_or_default())).collect()
+}
+
+pub fn materialize(history: &History, genesis: &Value, state: &Value) -> Materialization {
+    let genesis_digest = digest_bytes(&encode_value(genesis).unwrap_or_default());
+    let state_digest = digest_bytes(&encode_value(state).unwrap_or_default());
+    Materialization { genesis_digest, frontier: frontier(history), state_digest }
+}
+
+pub fn detect_conflict(history: &History) -> Option<Conflict> {
+    if history.nodes.len() < 2 {
+        return None;
+    }
+    let nodes = history.nodes.iter().map(|node| {
+        digest_bytes(&encode_value(&Value::Text(format!("{:?}", node))).unwrap_or_default())
+    }).collect();
+    Some(Conflict { nodes })
 }
 
 pub fn digest_bytes(bytes: &[u8]) -> Digest {
@@ -447,17 +889,35 @@ fn eval_expr(
             for arg in args {
                 call_args.push(eval_expr(arg, env, module, budget, receipts)?);
             }
+            if budget.max_depth == 0 {
+                return Err(Outcome::Exhausted("max_depth".to_string()));
+            }
+            budget.max_depth -= 1;
             eval_expr(&function.body, &call_args, module, budget, receipts)
         }
         Expr::Effect(name, payload) => {
             let request = eval_expr(payload, env, module, budget, receipts)?;
             let response = match name.as_str() {
-                "hash" => Value::Digest(digest_bytes(&encode_value(&request).unwrap_or_default())),
+                "hash" => {
+                    let encoded = encode_value(&request).map_err(|e| Outcome::Failed(format!("hash encode:{e:?}")))?;
+                    Value::Digest(digest_bytes(&encoded))
+                }
+                "cas_get" => match request {
+                    Value::Digest(digest) => match cas_get(digest) {
+                        Some(bytes) => Value::Bytes(bytes),
+                        None => Value::Unit,
+                    },
+                    _ => Value::Unit,
+                },
                 "cas_put" => {
-                    let mut store = CasStore::default();
-                    let digest = store.put(&encode_value(&request).unwrap_or_default());
+                    let bytes = match &request {
+                        Value::Bytes(bytes) => bytes.clone(),
+                        _ => encode_value(&request).map_err(|e| Outcome::Failed(format!("cas_put encode:{e:?}")))?,
+                    };
+                    let digest = cas_put(&bytes);
                     Value::Digest(digest)
                 }
+                "log_trace" => Value::Text(format!("trace:{name}")),
                 _ => Value::Text(format!("effect:{name}")),
             };
             receipts.push(Receipt {
@@ -490,7 +950,15 @@ fn eval_primitive(
             let [Value::Nat(a), Value::Nat(b)] = values.as_slice() else {
                 return Err(Outcome::Failed("nat_add expects nat values".to_string()));
             };
-            Ok(Value::Nat(a.saturating_add(*b)))
+            let sum = a.checked_add(*b).ok_or_else(|| Outcome::Failed("nat_add overflow".to_string()))?;
+            Ok(Value::Nat(sum))
+        }
+        "nat_mul" => {
+            let [Value::Nat(a), Value::Nat(b)] = values.as_slice() else {
+                return Err(Outcome::Failed("nat_mul expects nat values".to_string()));
+            };
+            let product = a.checked_mul(*b).ok_or_else(|| Outcome::Failed("nat_mul overflow".to_string()))?;
+            Ok(Value::Nat(product))
         }
         "bool_and" => {
             let [Value::Bool(a), Value::Bool(b)] = values.as_slice() else {
@@ -498,17 +966,49 @@ fn eval_primitive(
             };
             Ok(Value::Bool(*a && *b))
         }
+        "bool_or" => {
+            let [Value::Bool(a), Value::Bool(b)] = values.as_slice() else {
+                return Err(Outcome::Failed("bool_or expects bool values".to_string()));
+            };
+            Ok(Value::Bool(*a || *b))
+        }
         "eq_bytes" => {
             let [Value::Bytes(a), Value::Bytes(b)] = values.as_slice() else {
                 return Err(Outcome::Failed("eq_bytes expects bytes values".to_string()));
             };
             Ok(Value::Bool(a == b))
         }
+        "bytes_concat" => {
+            let [Value::Bytes(a), Value::Bytes(b)] = values.as_slice() else {
+                return Err(Outcome::Failed("bytes_concat expects bytes values".to_string()));
+            };
+            let mut out = a.clone();
+            out.extend_from_slice(b);
+            Ok(Value::Bytes(out))
+        }
         "len_bytes" => {
             let [Value::Bytes(bytes)] = values.as_slice() else {
                 return Err(Outcome::Failed("len_bytes expects bytes".to_string()));
             };
             Ok(Value::Nat(bytes.len() as u64))
+        }
+        "len_text" => {
+            let [Value::Text(text)] = values.as_slice() else {
+                return Err(Outcome::Failed("len_text expects text".to_string()));
+            };
+            Ok(Value::Nat(text.len() as u64))
+        }
+        "eq_text" => {
+            let [Value::Text(a), Value::Text(b)] = values.as_slice() else {
+                return Err(Outcome::Failed("eq_text expects text values".to_string()));
+            };
+            Ok(Value::Bool(a == b))
+        }
+        "eq_digest" => {
+            let [Value::Digest(a), Value::Digest(b)] = values.as_slice() else {
+                return Err(Outcome::Failed("eq_digest expects digest values".to_string()));
+            };
+            Ok(Value::Bool(a == b))
         }
         _ => Err(Outcome::Failed(format!("unknown primitive {name}"))),
     }
@@ -587,5 +1087,105 @@ mod tests {
         let digest = cas.put(payload);
         assert_eq!(cas.get(digest), Some(payload.to_vec()));
         assert_eq!(cas.get(digest_bytes(payload)), Some(payload.to_vec()));
+    }
+
+    #[test]
+    fn global_cas_round_trip_is_persistent() {
+        let payload = b"persistent-cas";
+        let digest = cas_put(payload);
+        assert_eq!(cas_get(digest), Some(payload.to_vec()));
+        assert_eq!(cas_get(digest_bytes(payload)), Some(payload.to_vec()));
+    }
+
+    #[test]
+    fn core_nat_add_and_effect_are_deterministic() {
+        let module = CoreModule {
+            functions: vec![CoreFunction {
+                arity: 2,
+                body: Expr::Primitive("nat_add".to_string(), vec![Expr::Argument(0), Expr::Argument(1)]),
+            }],
+        };
+        let verdict = eval_core(&module, 0, vec![Value::Nat(11), Value::Nat(31)]);
+        assert!(matches!(verdict.outcome, Outcome::Returned(Value::Nat(42))));
+        assert_eq!(verdict.steps, 3);
+
+        let effect_module = CoreModule {
+            functions: vec![CoreFunction {
+                arity: 0,
+                body: Expr::Effect("hash".to_string(), Box::new(Expr::Literal(Value::Text("abc".to_string())))),
+            }],
+        };
+        let effect_verdict = eval_core(&effect_module, 0, Vec::new());
+        assert!(matches!(effect_verdict.outcome, Outcome::Returned(Value::Digest(_))));
+        assert_eq!(effect_verdict.receipts.len(), 1);
+    }
+
+    #[test]
+    fn delta_laws_hold_for_a_simple_nat() {
+        let ty = TypeDescription::Nat;
+        let before = Value::Nat(3);
+        let after = Value::Nat(7);
+        let delta = diff_delta(&ty, &before, &after).unwrap();
+        let applied = apply_delta(&ty, &before, &delta).unwrap();
+        assert_eq!(applied, after);
+        assert_eq!(apply_delta(&ty, &applied, &Delta::Zero).unwrap(), applied);
+        let composed = compose_delta(&ty, &Delta::Zero, &delta).unwrap();
+        assert_eq!(apply_delta(&ty, &before, &composed).unwrap(), after);
+    }
+
+    #[test]
+    fn history_materialization_is_stable() {
+        let genesis = Value::Nat(0);
+        let state = Value::Nat(5);
+        let history = History { nodes: vec![OpNode { language_digest: digest_bytes(b"lang"), operation_digest: digest_bytes(b"op"), dependencies: vec![] }] };
+        let materialization = materialize(&history, &genesis, &state);
+        assert_eq!(materialization.genesis_digest, digest_bytes(&encode_value(&genesis).unwrap()));
+        assert_eq!(materialization.state_digest, digest_bytes(&encode_value(&state).unwrap()));
+        assert_eq!(frontier(&history).len(), 1);
+    }
+
+    #[test]
+    fn accelerator_matches_generic_core_execution() {
+        let module = CoreModule {
+            functions: vec![CoreFunction {
+                arity: 1,
+                body: Expr::Primitive("nat_add".to_string(), vec![Expr::Argument(0), Expr::Literal(Value::Nat(1))]),
+            }],
+        };
+        let arrow = Arrow {
+            input_type: TypeDescription::Nat,
+            output_type: TypeDescription::Nat,
+            core_module: module.clone(),
+            function_index: 0,
+        };
+        let generic = run_arrow(&arrow, Value::Nat(41));
+        let manifest = AccelManifest {
+            semantic_arrow: arrow.clone(),
+            source_closure_digest: digest_bytes(b"src"),
+            target_kind: "nat".to_string(),
+            implementation_digest: digest_bytes(b"accel"),
+        };
+        let registered_arrow = arrow.clone();
+        accel_register(manifest.implementation_digest, Arc::new(move |input, _budget| run_arrow(&registered_arrow, input)));
+        let accelerated = accel_run(&manifest, Value::Nat(41), Budget { max_steps: 64, max_depth: 32, max_alloc: None });
+        assert_eq!(observe(&generic), observe(&accelerated));
+    }
+
+    #[test]
+    fn conflicting_history_is_reported_explicitly() {
+        let left = OpNode {
+            language_digest: digest_bytes(b"lang"),
+            operation_digest: digest_bytes(b"left"),
+            dependencies: vec![],
+        };
+        let right = OpNode {
+            language_digest: digest_bytes(b"lang"),
+            operation_digest: digest_bytes(b"right"),
+            dependencies: vec![],
+        };
+        let history = History { nodes: vec![left, right] };
+        let conflict = detect_conflict(&history);
+        assert!(conflict.is_some());
+        assert_eq!(conflict.unwrap().nodes.len(), 2);
     }
 }

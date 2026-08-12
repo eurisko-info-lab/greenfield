@@ -42,6 +42,486 @@ object Cas {
   def get(digest: Array[Byte]): Option[Array[Byte]] = store.get(digest)
 }
 
+sealed trait TypeDescription
+case object TypeUnit extends TypeDescription
+case object TypeBool extends TypeDescription
+case object TypeNat extends TypeDescription
+case object TypeBytes extends TypeDescription
+case object TypeText extends TypeDescription
+case object TypeDigest extends TypeDescription
+case class TypeSum(left: TypeDescription, right: TypeDescription) extends TypeDescription
+case class TypeProduct(items: Vector[TypeDescription]) extends TypeDescription
+case class TypeSequence(itemType: TypeDescription) extends TypeDescription
+case class TypeFiniteMap(keyType: TypeDescription, valueType: TypeDescription) extends TypeDescription
+case object TypeRef extends TypeDescription
+case class TypeArrow(inputType: TypeDescription, outputType: TypeDescription) extends TypeDescription
+
+case class TypedNode(typeDigest: Array[Byte], value: Value)
+case class Graph(entries: scala.collection.mutable.Map[Array[Byte], TypedNode] = scala.collection.mutable.HashMap.empty[Array[Byte], TypedNode]) {
+  def insert(value: Value, typeDigest: Array[Byte]): Array[Byte] = {
+    val digest = Stratum.digestBytes(Stratum.encodeValue(value).toOption.getOrElse(Array.emptyByteArray))
+    entries.update(digest, TypedNode(typeDigest, value))
+    digest
+  }
+
+  def get(digest: Array[Byte]): Option[TypedNode] = entries.get(digest)
+}
+
+sealed trait GraphError
+case class MissingDigest(digest: Array[Byte]) extends GraphError
+case object TypeMismatch extends GraphError
+case object InvalidRef extends GraphError
+
+object GraphOps {
+  def typeDigestForValue(value: Value): Array[Byte] = value match {
+    case UnitValue => Stratum.digestBytes("unit".getBytes(StandardCharsets.UTF_8))
+    case BoolValue(_) => Stratum.digestBytes("bool".getBytes(StandardCharsets.UTF_8))
+    case NatValue(_) => Stratum.digestBytes("nat".getBytes(StandardCharsets.UTF_8))
+    case BytesValue(_) => Stratum.digestBytes("bytes".getBytes(StandardCharsets.UTF_8))
+    case TextValue(_) => Stratum.digestBytes("text".getBytes(StandardCharsets.UTF_8))
+    case SumValue(_, _) => Stratum.digestBytes("sum".getBytes(StandardCharsets.UTF_8))
+    case ProductValue(_) => Stratum.digestBytes("product".getBytes(StandardCharsets.UTF_8))
+    case SequenceValue(_) => Stratum.digestBytes("sequence".getBytes(StandardCharsets.UTF_8))
+    case FiniteMapValue(_) => Stratum.digestBytes("finitemap".getBytes(StandardCharsets.UTF_8))
+    case DigestValue(_) => Stratum.digestBytes("digest".getBytes(StandardCharsets.UTF_8))
+    case RefValue(_, _) => Stratum.digestBytes("ref".getBytes(StandardCharsets.UTF_8))
+  }
+
+  def checkType(value: Value, ty: TypeDescription, graph: Graph): Either[GraphError, Unit] = {
+    (value, ty) match {
+      case (UnitValue, TypeUnit) => Right(())
+      case (BoolValue(_), TypeBool) => Right(())
+      case (NatValue(_), TypeNat) => Right(())
+      case (BytesValue(_), TypeBytes) => Right(())
+      case (TextValue(_), TypeText) => Right(())
+      case (DigestValue(_), TypeDigest) => Right(())
+      case (SumValue(_, payload), TypeSum(left, right)) =>
+        checkType(payload, right, graph).flatMap(_ => checkType(UnitValue, left, graph))
+      case (ProductValue(items), TypeProduct(types)) if items.length == types.length =>
+        items.zip(types).foldLeft[Either[GraphError, Unit]](Right(())) {
+          case (Right(_), (item, itemType)) => checkType(item, itemType, graph)
+          case (Left(err), _) => Left(err)
+        }
+      case (SequenceValue(items), TypeSequence(itemType)) =>
+        items.foldLeft[Either[GraphError, Unit]](Right(())) {
+          case (Right(_), item) => checkType(item, itemType, graph)
+          case (Left(err), _) => Left(err)
+        }
+      case (FiniteMapValue(entries), TypeFiniteMap(keyType, valueType)) =>
+        entries.foldLeft[Either[GraphError, Unit]](Right(())) {
+          case (Right(_), (key, value)) =>
+            checkType(key, keyType, graph).flatMap(_ => checkType(value, valueType, graph))
+          case (Left(err), _) => Left(err)
+        }
+      case (RefValue(digest, typeDigest), TypeRef) =>
+        graph.get(digest).toRight(MissingDigest(digest)).flatMap { node =>
+          if (java.util.Arrays.equals(node.typeDigest, typeDigest)) Right(()) else Left(TypeMismatch)
+        }
+      case (RefValue(digest, typeDigest), _) =>
+        graph.get(digest).toRight(MissingDigest(digest)).flatMap { node =>
+          if (java.util.Arrays.equals(node.typeDigest, typeDigest)) Right(()) else Left(TypeMismatch)
+        }
+      case _ => Left(TypeMismatch)
+    }
+  }
+
+  def close(graph: Graph, rootDigest: Array[Byte]): Either[GraphError, Vector[Array[Byte]]] = {
+    val seen = scala.collection.mutable.HashSet.empty[String]
+    val stack = scala.collection.mutable.ArrayBuffer(rootDigest)
+    val out = scala.collection.mutable.ArrayBuffer.empty[Array[Byte]]
+    while (stack.nonEmpty) {
+      val digest = stack.remove(stack.length - 1)
+      val key = Stratum.hexEncode(digest)
+      if (!seen.contains(key)) {
+        seen.add(key)
+        out += digest
+        graph.get(digest) match {
+          case Some(node) =>
+            node.value match {
+              case RefValue(childDigest, typeDigest) =>
+                if (graph.get(childDigest).exists(_.typeDigest.sameElements(typeDigest))) {
+                  stack += childDigest
+                } else {
+                  return Left(TypeMismatch)
+                }
+              case _ =>
+            }
+          case None => return Left(MissingDigest(digest))
+        }
+      }
+    }
+    Right(out.toVector)
+  }
+}
+
+case class Arrow(
+  inputType: TypeDescription,
+  outputType: TypeDescription,
+  coreModule: CoreModule,
+  functionIndex: Int,
+)
+
+case class Lens(
+  sourceType: TypeDescription,
+  viewType: TypeDescription,
+  getArrow: Arrow,
+  modifyArrow: Arrow,
+)
+
+object ArrowOps {
+  def runArrow(arrow: Arrow, input: Value): Verdict = Core.evalCore(arrow.coreModule, arrow.functionIndex, Vector(input))
+
+  def runLensGet(lens: Lens, input: Value): Verdict = runArrow(lens.getArrow, input)
+
+  def runLensModify(lens: Lens, input: Value, newView: Value): Verdict =
+    runArrow(lens.modifyArrow, ProductValue(Vector(input, newView)))
+}
+
+sealed trait Delta
+case object DeltaZero extends Delta
+case class DeltaReplace(value: Value) extends Delta
+case class DeltaProduct(items: Vector[Delta]) extends Delta
+case class DeltaSum(tag: Long, delta: Delta) extends Delta
+case class DeltaSequence(index: Int, value: Value) extends Delta
+case class DeltaMapInsert(key: Value, value: Value) extends Delta
+case class DeltaMapRemove(key: Value) extends Delta
+case class DeltaBytesAppend(value: Array[Byte]) extends Delta
+
+sealed trait DeltaError
+case object DeltaTypeMismatch extends DeltaError
+case object DeltaNotComposable extends DeltaError
+case object InvalidDeltaIndex extends DeltaError
+case class UnsupportedDelta(msg: String) extends DeltaError
+
+object DeltaOps {
+  def zeroForType(ty: TypeDescription): Delta = ty match {
+    case TypeUnit | TypeBool | TypeNat | TypeBytes | TypeText | TypeDigest | TypeRef | TypeArrow(_, _) => DeltaZero
+    case TypeProduct(items) => DeltaProduct(items.map(_ => DeltaZero))
+    case TypeSequence(_) => DeltaZero
+    case TypeFiniteMap(_, _) => DeltaZero
+    case TypeSum(_, _) => DeltaZero
+  }
+
+  def applyDelta(ty: TypeDescription, value: Value, delta: Delta): Either[DeltaError, Value] =
+    (ty, value, delta) match {
+      case (_, _, DeltaZero) => Right(value)
+      case (_, _, DeltaReplace(next)) => Right(next)
+      case (TypeProduct(types), ProductValue(items), DeltaProduct(deltas)) if items.length == types.length && deltas.length == types.length =>
+        items.zip(types).zip(deltas).foldLeft[Either[DeltaError, Vector[Value]]](Right(Vector.empty)) {
+          case (Right(acc), ((item, itemType), itemDelta)) => applyDelta(itemType, item, itemDelta).map(acc :+ _)
+          case (Left(err), _) => Left(err)
+        }.map(ProductValue(_))
+      case (TypeSequence(_), SequenceValue(items), DeltaSequence(index, replacement)) if index >= 0 && index < items.length =>
+        val next = items.updated(index, replacement)
+        Right(SequenceValue(next))
+      case (TypeFiniteMap(_, _), FiniteMapValue(entries), DeltaMapInsert(key, value)) =>
+        val updated = entries.indexWhere { case (existing, _) => existing == key }
+        if (updated >= 0) {
+          val next = entries.updated(updated, key -> value)
+          Right(FiniteMapValue(next))
+        } else {
+          Right(FiniteMapValue(entries :+ (key -> value)))
+        }
+      case (TypeFiniteMap(_, _), FiniteMapValue(entries), DeltaMapRemove(key)) =>
+        Right(FiniteMapValue(entries.filterNot { case (existing, _) => existing == key }))
+      case (TypeBytes, BytesValue(bytes), DeltaBytesAppend(extra)) =>
+        Right(BytesValue(bytes ++ extra))
+      case _ => Left(DeltaTypeMismatch)
+    }
+
+  def diffDelta(ty: TypeDescription, before: Value, after: Value): Either[DeltaError, Delta] =
+    if (before == after) Right(DeltaZero)
+    else (ty, before, after) match {
+      case (TypeProduct(types), ProductValue(beforeItems), ProductValue(afterItems)) if beforeItems.length == afterItems.length && beforeItems.length == types.length =>
+        val deltas = beforeItems.zip(afterItems).zip(types).map { case ((b, a), t) => diffDelta(t, b, a) }
+        val combined = deltas.foldLeft[Either[DeltaError, Vector[Delta]]](Right(Vector.empty)) {
+          case (Right(acc), Right(delta)) => Right(acc :+ delta)
+          case (Left(err), _) => Left(err)
+          case (_, Left(err)) => Left(err)
+        }
+        combined.map(DeltaProduct(_))
+      case (TypeSequence(_), SequenceValue(beforeItems), SequenceValue(afterItems)) if beforeItems.length == afterItems.length =>
+        val deltas = beforeItems.zip(afterItems).zipWithIndex.map { case ((_, a), idx) => DeltaSequence(idx, a) }
+        Right(DeltaProduct(deltas.toVector))
+      case (TypeFiniteMap(_, _), FiniteMapValue(beforeEntries), FiniteMapValue(afterEntries)) =>
+        val inserts = afterEntries.collect {
+          case (key, value) if !beforeEntries.exists { case (existing, _) => existing == key } || beforeEntries.find { case (existing, _) => existing == key }.exists(_._2 != value) => DeltaMapInsert(key, value)
+        }
+        val removes = beforeEntries.collect {
+          case (key, _) if !afterEntries.exists { case (existing, _) => existing == key } => DeltaMapRemove(key)
+        }
+        val result = inserts ++ removes
+        if (result.isEmpty) Right(DeltaZero) else Right(DeltaProduct(result.toVector))
+      case _ => Right(DeltaReplace(after))
+    }
+
+  def composeDelta(ty: TypeDescription, left: Delta, right: Delta): Either[DeltaError, Delta] =
+    (left, right) match {
+      case (DeltaZero, _) => Right(right)
+      case (_, DeltaZero) => Right(left)
+      case (DeltaReplace(_), DeltaReplace(next)) => Right(DeltaReplace(next))
+      case (DeltaProduct(xs), DeltaProduct(ys)) if xs.length == ys.length =>
+        val combined = xs.zip(ys).foldLeft[Either[DeltaError, Vector[Delta]]](Right(Vector.empty)) {
+          case (Right(acc), (x, y)) => composeDelta(ty, x, y).map(acc :+ _)
+          case (Left(err), _) => Left(err)
+        }
+        combined.map(DeltaProduct(_))
+      case _ => Left(DeltaNotComposable)
+    }
+}
+
+sealed trait Operation
+case object NoopOperation extends Operation
+case class SetNatOperation(value: Long) extends Operation
+case class AddNatOperation(delta: Long) extends Operation
+case class SetTextOperation(value: String) extends Operation
+case class MapInsertOperation(key: Value, value: Value) extends Operation
+case class SequencePushOperation(value: Value) extends Operation
+
+case class OperationLanguage(operationType: TypeDescription, stateType: TypeDescription)
+
+object OperationLanguageOps {
+  def elaborate(language: OperationLanguage, state: Value, operation: Operation): Either[DeltaError, Delta] =
+    (language.stateType, state, operation) match {
+      case (TypeNat, _, SetNatOperation(value)) => Right(DeltaReplace(NatValue(value)))
+      case (TypeNat, NatValue(current), AddNatOperation(delta)) => Right(DeltaReplace(NatValue(current + delta)))
+      case (TypeText, _, SetTextOperation(value)) => Right(DeltaReplace(TextValue(value)))
+      case (TypeFiniteMap(_, _), FiniteMapValue(_), MapInsertOperation(key, value)) => Right(DeltaMapInsert(key, value))
+      case (TypeSequence(_), SequenceValue(_), SequencePushOperation(value)) => Right(DeltaSequence(0, value))
+      case _ => Left(UnsupportedDelta("operation unsupported for state type"))
+    }
+
+  def reachable(genesis: Value, operations: Vector[Operation], depth: Int): Either[DeltaError, Vector[Value]] = {
+    var current = genesis
+    val states = scala.collection.mutable.ArrayBuffer(current)
+    var count = 0
+    while (count < depth && count < operations.length) {
+      val language = OperationLanguage(TypeNat, TypeNat)
+      val delta = elaborate(language, current, operations(count)).flatMap(DeltaOps.applyDelta(language.stateType, current, _))
+      delta match {
+        case Right(next) =>
+          current = next
+          states += current
+        case Left(err) => return Left(err)
+      }
+      count += 1
+    }
+    Right(states.toVector)
+  }
+}
+
+case class OpNode(languageDigest: Array[Byte], operationDigest: Array[Byte], dependencies: Vector[Array[Byte]])
+case class History(nodes: Vector[OpNode])
+case class Materialization(genesisDigest: Array[Byte], frontier: Vector[Array[Byte]], stateDigest: Array[Byte])
+case class Conflict(nodes: Vector[Array[Byte]])
+
+case class AccelManifest(
+  semanticArrow: Arrow,
+  sourceClosureDigest: Array[Byte],
+  targetKind: String,
+  implementationDigest: Array[Byte],
+)
+
+case class AccelBinding(manifestDigest: Array[Byte], credentialDigest: Option[Array[Byte]])
+
+object AccelRegistry {
+  private val registry = scala.collection.mutable.HashMap.empty[Array[Byte], (Value, Budget) => Verdict]
+
+  def register(implementationDigest: Array[Byte], implementation: (Value, Budget) => Verdict): Unit =
+    registry.update(implementationDigest, implementation)
+
+  def run(manifest: AccelManifest, input: Value, budget: Budget): Verdict =
+    registry.get(manifest.implementationDigest).map(_(input, budget)).getOrElse(ArrowOps.runArrow(manifest.semanticArrow, input))
+}
+
+object HistoryOps {
+  def frontier(history: History): Vector[Array[Byte]] =
+    history.nodes.map(node => Stratum.digestBytes(Stratum.encodeValue(TextValue(node.toString)).toOption.getOrElse(Array.emptyByteArray)))
+
+  def materialize(history: History, genesis: Value, state: Value): Materialization = {
+    val genesisDigest = Stratum.digestBytes(Stratum.encodeValue(genesis).toOption.getOrElse(Array.emptyByteArray))
+    val stateDigest = Stratum.digestBytes(Stratum.encodeValue(state).toOption.getOrElse(Array.emptyByteArray))
+    Materialization(genesisDigest, frontier(history), stateDigest)
+  }
+
+  def detectConflict(history: History): Option[Conflict] =
+    if (history.nodes.length < 2) None
+    else Some(Conflict(history.nodes.map(node => Stratum.digestBytes(Stratum.encodeValue(TextValue(node.toString)).toOption.getOrElse(Array.emptyByteArray)))))
+}
+
+sealed trait CoreExpr
+case class LiteralExpr(value: Value) extends CoreExpr
+case class ArgumentExpr(index: Long) extends CoreExpr
+case class LocalExpr(index: Long) extends CoreExpr
+case class LetExpr(left: CoreExpr, right: CoreExpr) extends CoreExpr
+case class ProductExpr(items: Vector[CoreExpr]) extends CoreExpr
+case class SumExpr(tag: Long, payload: CoreExpr) extends CoreExpr
+case class MatchExpr(scrutinee: CoreExpr, arms: Vector[CoreExpr]) extends CoreExpr
+case class PrimitiveExpr(name: String, args: Vector[CoreExpr]) extends CoreExpr
+case class CallExpr(index: Long, args: Vector[CoreExpr]) extends CoreExpr
+case class EffectExpr(name: String, payload: CoreExpr) extends CoreExpr
+
+case class CoreFunction(arity: Long, body: CoreExpr)
+case class CoreModule(functions: Vector[CoreFunction])
+
+case class Receipt(
+  capabilityDigest: Array[Byte],
+  handlerDigest: Array[Byte],
+  requestDigest: Array[Byte],
+  responseDigest: Array[Byte],
+  status: String,
+)
+
+sealed trait Outcome
+case class Returned(value: Value) extends Outcome
+case class Failed(msg: String) extends Outcome
+case class Exhausted(kind: String) extends Outcome
+
+case class Budget(maxSteps: Long, maxDepth: Long, maxAlloc: Option[Long] = None)
+case class Verdict(outcome: Outcome, steps: Long, receipts: Vector[Receipt])
+
+object Core {
+  private val MaxDepth = 32L
+
+  def casPut(bytes: Array[Byte]): Array[Byte] = Cas.put(bytes)
+
+  def casGet(digest: Array[Byte]): Option[Array[Byte]] = Cas.get(digest)
+
+  def evalCore(module: CoreModule, functionIndex: Int, args: Vector[Value]): Verdict = {
+    val budget = Budget(64L, MaxDepth)
+    val initialSteps = budget.maxSteps
+    val receipts = scala.collection.mutable.ArrayBuffer.empty[Receipt]
+    val outcome = evalExpr(module.functions(functionIndex).body, args, module, budget, receipts) match {
+      case Right(value) => Returned(value)
+      case Left(err) => err
+    }
+    val consumed = initialSteps - budget.maxSteps
+    Verdict(outcome, consumed, receipts.toVector)
+  }
+
+  private def evalExpr(
+    expr: CoreExpr,
+    env: Vector[Value],
+    module: CoreModule,
+    budget: Budget,
+    receipts: scala.collection.mutable.ArrayBuffer[Receipt],
+  ): Either[Outcome, Value] = {
+    if (budget.maxSteps == 0) return Left(Exhausted("max_steps"))
+    val nextBudget = budget.copy(maxSteps = budget.maxSteps - 1)
+
+    expr match {
+      case LiteralExpr(value) => Right(value)
+      case ArgumentExpr(index) =>
+        env.lift(index.toInt).toRight(Failed(s"missing arg $index"))
+      case LocalExpr(index) =>
+        env.lift(index.toInt).toRight(Failed(s"missing local $index"))
+      case LetExpr(left, right) =>
+        for {
+          value <- evalExpr(left, env, module, nextBudget, receipts)
+          next = env :+ value
+          result <- evalExpr(right, next, module, nextBudget, receipts)
+        } yield result
+      case ProductExpr(items) =>
+        val values = items.iterator.foldLeft(Right(Vector.empty[Value]): Either[Outcome, Vector[Value]]) {
+          case (Right(acc), item) => evalExpr(item, env, module, nextBudget, receipts).map(acc :+ _)
+          case (Left(err), _) => Left(err)
+        }
+        values.map(ProductValue(_))
+      case SumExpr(tag, payload) =>
+        evalExpr(payload, env, module, nextBudget, receipts).map(SumValue(tag, _))
+      case MatchExpr(scrutinee, arms) =>
+        evalExpr(scrutinee, env, module, nextBudget, receipts).flatMap {
+          case SumValue(tag, payload) =>
+            arms.lift(tag.toInt).toRight(Failed("no match arm")).flatMap(expr =>
+              evalExpr(expr, env :+ payload, module, nextBudget, receipts)
+            )
+          case _ => Left(Failed("non-sum match"))
+        }
+      case PrimitiveExpr(name, args) => evalPrimitive(name, args, env, module, nextBudget, receipts)
+      case CallExpr(index, args) =>
+        val function = module.functions.lift(index.toInt).toRight(Failed("unknown call"))
+        function.flatMap { fn =>
+          if (fn.arity != args.length.toLong) Left(Failed("arity mismatch"))
+          else {
+            val callArgs = args.iterator.foldLeft(Right(Vector.empty[Value]): Either[Outcome, Vector[Value]]) {
+              case (Right(acc), arg) => evalExpr(arg, env, module, nextBudget, receipts).map(acc :+ _)
+              case (Left(err), _) => Left(err)
+            }
+            callArgs.flatMap { values =>
+              if (nextBudget.maxDepth == 0) Left(Exhausted("max_depth"))
+              else evalExpr(fn.body, values, module, nextBudget.copy(maxDepth = nextBudget.maxDepth - 1), receipts)
+            }
+          }
+        }
+      case EffectExpr(name, payload) =>
+        val request = evalExpr(payload, env, module, nextBudget, receipts)
+        request.map { req =>
+          val response = name match {
+            case "hash" =>
+              val encoded = Stratum.encodeValue(req).toOption.getOrElse(Array.emptyByteArray)
+              DigestValue(Stratum.digestBytes(encoded))
+            case "cas_get" =>
+              req match {
+                case DigestValue(digest) => Cas.get(digest).map(BytesValue(_)).getOrElse(UnitValue)
+                case _ => UnitValue
+              }
+            case "cas_put" =>
+              val bytes = req match {
+                case BytesValue(bs) => bs
+                case other => Stratum.encodeValue(other).toOption.getOrElse(Array.emptyByteArray)
+              }
+              val digest = Cas.put(bytes)
+              DigestValue(digest)
+            case "log_trace" => TextValue(s"trace:$name")
+            case _ => TextValue(s"effect:$name")
+          }
+          val requestBytes = Stratum.encodeValue(req).toOption.getOrElse(Array.emptyByteArray)
+          val responseBytes = Stratum.encodeValue(response).toOption.getOrElse(Array.emptyByteArray)
+          receipts += Receipt(
+            Stratum.digestBytes(name.getBytes(StandardCharsets.UTF_8)),
+            Stratum.digestBytes(s"$name:handler".getBytes(StandardCharsets.UTF_8)),
+            Stratum.digestBytes(requestBytes),
+            Stratum.digestBytes(responseBytes),
+            "ok"
+          )
+          response
+        }
+    }
+  }
+
+  private def evalPrimitive(
+    name: String,
+    args: Vector[CoreExpr],
+    env: Vector[Value],
+    module: CoreModule,
+    budget: Budget,
+    receipts: scala.collection.mutable.ArrayBuffer[Receipt],
+  ): Either[Outcome, Value] = {
+    val values = args.iterator.foldLeft(Right(Vector.empty[Value]): Either[Outcome, Vector[Value]]) {
+      case (Right(acc), arg) => evalExpr(arg, env, module, budget, receipts).map(acc :+ _)
+      case (Left(err), _) => Left(err)
+    }
+
+    values.flatMap {
+      case Vector(NatValue(a), NatValue(b)) if name == "nat_add" =>
+        if (a > 0 && b > Long.MaxValue - a || a < 0 && b < Long.MinValue - a) Left(Failed("nat_add overflow"))
+        else Right(NatValue(a + b))
+      case Vector(NatValue(a), NatValue(b)) if name == "nat_mul" =>
+        if (a != 0 && (b > Long.MaxValue / a || b < Long.MinValue / a)) Left(Failed("nat_mul overflow"))
+        else Right(NatValue(a * b))
+      case Vector(BoolValue(a), BoolValue(b)) if name == "bool_and" => Right(BoolValue(a && b))
+      case Vector(BoolValue(a), BoolValue(b)) if name == "bool_or" => Right(BoolValue(a || b))
+      case Vector(BytesValue(a), BytesValue(b)) if name == "eq_bytes" => Right(BoolValue(java.util.Arrays.equals(a, b)))
+      case Vector(BytesValue(a), BytesValue(b)) if name == "bytes_concat" => Right(BytesValue(a ++ b))
+      case Vector(BytesValue(bytes)) if name == "len_bytes" => Right(NatValue(bytes.length.toLong))
+      case Vector(TextValue(a), TextValue(b)) if name == "eq_text" => Right(BoolValue(a == b))
+      case Vector(TextValue(text)) if name == "len_text" => Right(NatValue(text.length.toLong))
+      case Vector(DigestValue(a), DigestValue(b)) if name == "eq_digest" => Right(BoolValue(java.util.Arrays.equals(a, b)))
+      case _ => Left(Failed(s"unknown primitive $name"))
+    }
+  }
+}
+
 object Stratum {
   private val MaxDepth = 64
 

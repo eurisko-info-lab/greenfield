@@ -1,29 +1,29 @@
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m-- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:90:49 [0m[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m90 |[0m      input.stripPrefix([31m"nat="[0m).toLongOption.map(NatValue)[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m   |[0m                                                 ^^^^^^^^[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m   |[0mThe method `apply` is inserted. The auto insertion will be deprecated, please write `greenfield.NatValue.apply` explicitly.[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m-- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:138:12 [0m[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m138 |[0m            [33mreturn[0m Left(CanonError([31m"duplicate map key"[0m))[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m    |[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m    |[0mNon local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m-- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:162:26 [0m[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m162 |[0m        [33mcase[0m Left(err) => [33mreturn[0m Left(err)[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m    |[0m                          ^^^^^^^^^^^^^^^^[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m    |[0mNon local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m-- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:241:28 [0m[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m241 |[0m          [33mcase[0m Left(err) => [33mreturn[0m Left(err)[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m    |[0m                            ^^^^^^^^^^^^^^^^[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m    |[0mNon local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m-- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:260:35 [0m[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m260 |[0m            [33mif[0m (!seen.add(keyHex)) [33mreturn[0m Left(CanonError([31m"duplicate map key"[0m))[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m    |[0m                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m    |[0mNon local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m-- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:265:32 [0m[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m265 |[0m              [33mcase[0m Left(err) => [33mreturn[0m Left(err)[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m    |[0m                                ^^^^^^^^^^^^^^^^[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m    |[0mNon local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m-- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:267:28 [0m[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m267 |[0m          [33mcase[0m Left(err) => [33mreturn[0m Left(err)[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m[33m    |[0m                            ^^^^^^^^^^^^^^^^[0m[0m
-[0m[[0m[33mwarn[0m] [0m[0m[33m    |[0mNon local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead[0m
-[0m[[0m[33mwarn[0m] [0m[0m7 warnings found[0m
+[warn] -- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:570:49 
+[warn] 570 |      input.stripPrefix("nat=").toLongOption.map(NatValue)
+[warn]     |                                                 ^^^^^^^^
+[warn]     |The method `apply` is inserted. The auto insertion will be deprecated, please write `greenfield.NatValue.apply` explicitly.
+[warn] -- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:618:12 
+[warn] 618 |            return Left(CanonError("duplicate map key"))
+[warn]     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[warn]     |Non local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead
+[warn] -- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:642:26 
+[warn] 642 |        case Left(err) => return Left(err)
+[warn]     |                          ^^^^^^^^^^^^^^^^
+[warn]     |Non local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead
+[warn] -- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:721:28 
+[warn] 721 |          case Left(err) => return Left(err)
+[warn]     |                            ^^^^^^^^^^^^^^^^
+[warn]     |Non local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead
+[warn] -- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:740:35 
+[warn] 740 |            if (!seen.add(keyHex)) return Left(CanonError("duplicate map key"))
+[warn]     |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[warn]     |Non local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead
+[warn] -- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:745:32 
+[warn] 745 |              case Left(err) => return Left(err)
+[warn]     |                                ^^^^^^^^^^^^^^^^
+[warn]     |Non local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead
+[warn] -- Warning: /home/patrick/greenfield/host-scala/src/main/scala/greenfield/Stratum.scala:747:28 
+[warn] 747 |          case Left(err) => return Left(err)
+[warn]     |                            ^^^^^^^^^^^^^^^^
+[warn]     |Non local returns are no longer supported; use `boundary` and `boundary.break` in `scala.util` instead
+[warn] 7 warnings found

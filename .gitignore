@@ -2,3 +2,5 @@
 .metals/
 target/
 out/
+.scala-build/
+.metals/metals.log
