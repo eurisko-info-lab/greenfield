@@ -251,16 +251,31 @@ pub fn close(graph: &Graph, root_digest: Digest) -> Result<Vec<Digest>, GraphErr
 }
 
 pub fn traverse(graph: &Graph, closure: &[Digest], path: &[usize]) -> Result<Value, GraphError> {
-    let digest = closure.get(path[0]).copied().ok_or(GraphError::Unexpected("empty path".to_string()))?;
-    let node = graph.get(digest).ok_or(GraphError::MissingDigest(digest))?;
-    if path.len() == 1 { return Ok(node.value.clone()); }
-    match &node.value {
-        Value::Ref { digest: child_digest, .. } => {
-            let index = closure.iter().position(|d| d == child_digest).ok_or(GraphError::MissingDigest(*child_digest))?;
-            traverse(graph, closure, &[index])
-        }
-        _ => Err(GraphError::Unexpected("non-ref traversal".to_string())),
+    if path.is_empty() {
+        return Err(GraphError::Unexpected("empty path".to_string()));
     }
+
+    let mut current_index = *path.first().unwrap();
+    let mut current_digest = closure.get(current_index).copied().ok_or(GraphError::Unexpected("path index out of range".to_string()))?;
+    let mut current = graph.get(current_digest).ok_or(GraphError::MissingDigest(current_digest))?.clone();
+
+    for &next_index in &path[1..] {
+        let child_digest = match &current.value {
+            Value::Ref { digest, .. } => *digest,
+            _ => return Err(GraphError::Unexpected("non-ref traversal".to_string())),
+        };
+
+        let expected_index = closure.iter().position(|d| d == &child_digest).ok_or(GraphError::MissingDigest(child_digest))?;
+        if expected_index != next_index {
+            return Err(GraphError::Unexpected("path does not match closure".to_string()));
+        }
+
+        current_index = next_index;
+        current_digest = closure.get(current_index).copied().ok_or(GraphError::Unexpected("path index out of range".to_string()))?;
+        current = graph.get(current_digest).ok_or(GraphError::MissingDigest(current_digest))?.clone();
+    }
+
+    Ok(current.value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -553,6 +568,257 @@ pub fn detect_conflict(history: &History) -> Option<Conflict> {
         digest_bytes(&encode_value(&Value::Text(format!("{:?}", node))).unwrap_or_default())
     }).collect();
     Some(Conflict { nodes })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityManifest {
+    pub digest: Digest,
+    pub capability: String,
+    pub effect_kind: String,
+    pub restrictions: Vec<String>,
+    pub policy_digest: Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectPolicy {
+    pub digest: Digest,
+    pub effect_kind: String,
+    pub allowed_capabilities: Vec<Digest>,
+    pub require_proof: bool,
+    pub policy_digest: Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoricalReceipt {
+    pub receipt_digest: Digest,
+    pub capability_digest: Digest,
+    pub handler_digest: Digest,
+    pub request_digest: Digest,
+    pub response_digest: Digest,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Claim {
+    pub digest: Digest,
+    pub actor: String,
+    pub claim_type: String,
+    pub subject_digest: Digest,
+    pub evidence: Vec<Digest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceBundle {
+    pub digest: Digest,
+    pub claim_digest: Digest,
+    pub evidence: Vec<Digest>,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Constitution {
+    pub digest: Digest,
+    pub name: String,
+    pub rules: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decision {
+    pub digest: Digest,
+    pub constitution_digest: Digest,
+    pub claim_digest: Digest,
+    pub outcome: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionProfile {
+    pub digest: Digest,
+    pub runner_digest: Digest,
+    pub profile_name: String,
+    pub capacity: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bottleneck {
+    pub digest: Digest,
+    pub stage: String,
+    pub description: String,
+    pub observed_limit: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccelerationContract {
+    pub digest: Digest,
+    pub semantic_arrow_digest: Digest,
+    pub accelerator_digest: Digest,
+    pub requirements: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccelerationNeed {
+    pub digest: Digest,
+    pub subject_digest: Digest,
+    pub need_kind: String,
+    pub priority: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunnerIdentity {
+    pub digest: Digest,
+    pub name: String,
+    pub public_key_digest: Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionClaim {
+    pub digest: Digest,
+    pub runner_digest: Digest,
+    pub execution_digest: Digest,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunnerAttestation {
+    pub digest: Digest,
+    pub runner_digest: Digest,
+    pub attestation_digest: Digest,
+    pub assertion: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceleratorCredential {
+    pub digest: Digest,
+    pub runner_digest: Digest,
+    pub capability_digest: Digest,
+    pub scope: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrookedNotice {
+    pub digest: Digest,
+    pub runner_digest: Digest,
+    pub reason: String,
+    pub evidence: Vec<Digest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphChangeClaim {
+    pub digest: Digest,
+    pub before_digest: Digest,
+    pub after_digest: Digest,
+    pub change_kind: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeAttestation {
+    pub digest: Digest,
+    pub node_digest: Digest,
+    pub attestor_digest: Digest,
+    pub claim: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettlementDecision {
+    pub digest: Digest,
+    pub claim_digest: Digest,
+    pub decision: String,
+    pub voter_digest: Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionConstitution {
+    pub digest: Digest,
+    pub name: String,
+    pub retention_policy: String,
+    pub witness: Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionObligation {
+    pub digest: Digest,
+    pub constitution_digest: Digest,
+    pub subject_digest: Digest,
+    pub duration: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayCapsule {
+    pub digest: Digest,
+    pub origin_digest: Digest,
+    pub frontier_digest: Digest,
+    pub replay_log: Vec<Digest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconstructionRecipe {
+    pub digest: Digest,
+    pub genesis_digest: Digest,
+    pub input_history: Vec<Digest>,
+    pub reconstruction: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Goal {
+    pub digest: Digest,
+    pub name: String,
+    pub objective: String,
+    pub success_criteria: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompiledContext {
+    pub digest: Digest,
+    pub goal_digest: Digest,
+    pub environment_digest: Digest,
+    pub notes: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvestigationTurn {
+    pub digest: Digest,
+    pub context_digest: Digest,
+    pub turn_index: u64,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvestigationState {
+    pub digest: Digest,
+    pub current_turn: u64,
+    pub state_name: String,
+    pub evidence: Vec<Digest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StudioProjection {
+    pub digest: Digest,
+    pub subject_digest: Digest,
+    pub perspective: String,
+    pub notes: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditorProjection {
+    pub digest: Digest,
+    pub subject_digest: Digest,
+    pub editor_id: String,
+    pub selection: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundationRoot {
+    pub digest: Digest,
+    pub name: String,
+    pub version: String,
+    pub seed_digest: Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundationSuccessorClaim {
+    pub digest: Digest,
+    pub root_digest: Digest,
+    pub successor_digest: Digest,
+    pub reason: String,
 }
 
 pub fn digest_bytes(bytes: &[u8]) -> Digest {
@@ -1169,6 +1435,17 @@ mod tests {
         accel_register(manifest.implementation_digest, Arc::new(move |input, _budget| run_arrow(&registered_arrow, input)));
         let accelerated = accel_run(&manifest, Value::Nat(41), Budget { max_steps: 64, max_depth: 32, max_alloc: None });
         assert_eq!(observe(&generic), observe(&accelerated));
+    }
+
+    #[test]
+    fn closure_traverse_follows_nested_refs() {
+        let mut graph = Graph::default();
+        let leaf = graph.insert(Value::Nat(7), digest_bytes(b"nat"));
+        let middle = graph.insert(Value::Ref { digest: leaf, type_digest: digest_bytes(b"nat") }, digest_bytes(b"ref"));
+        let root = graph.insert(Value::Ref { digest: middle, type_digest: digest_bytes(b"ref") }, digest_bytes(b"ref"));
+        let closure = close(&graph, root).unwrap();
+        assert_eq!(closure.len(), 3);
+        assert_eq!(traverse(&graph, &closure, &[0, 1, 2]), Ok(Value::Nat(7)));
     }
 
     #[test]
