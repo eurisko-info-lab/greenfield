@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+if [ "$#" -gt 0 ]; then
+  FIXTURES=("$@")
+else
+  mapfile -t FIXTURES < <(find "$ROOT/fixtures" -type f | sort)
+fi
+
+for fixture in "${FIXTURES[@]}"; do
+  rust_out=$(cargo run --quiet --bin stratum-rust -- fixture "$fixture")
+  scala_out=$(cd "$ROOT/host-scala" && sbt -error "runMain greenfield.Stratum fixture \"$fixture\"" | tail -n 1)
+  if [ "$rust_out" != "$scala_out" ]; then
+    echo "PARITY MISMATCH: $fixture" >&2
+    echo "RUST: $rust_out" >&2
+    echo "SCALA: $scala_out" >&2
+    exit 1
+  fi
+  echo "$rust_out"
+done
