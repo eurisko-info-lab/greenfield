@@ -294,6 +294,12 @@ pub struct Lens {
     pub modify_arrow: Arrow,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Language {
+    pub carrier_type: TypeDescription,
+    pub named_lenses: HashMap<String, Lens>,
+}
+
 pub fn run_arrow(arrow: &Arrow, input: Value) -> Verdict {
     eval_core(&arrow.core_module, arrow.function_index, vec![input])
 }
@@ -305,6 +311,46 @@ pub fn run_lens_get(lens: &Lens, input: Value) -> Verdict {
 pub fn run_lens_modify(lens: &Lens, input: Value, new_view: Value) -> Verdict {
     let payload = Value::Product(vec![input, new_view]);
     run_arrow(&lens.modify_arrow, payload)
+}
+
+pub fn compose_arrow(left: &Arrow, right: &Arrow) -> Result<Arrow, GraphError> {
+    if left.output_type != right.input_type {
+        return Err(GraphError::TypeMismatch);
+    }
+
+    let offset = left.core_module.functions.len();
+    let mut functions = left.core_module.functions.clone();
+    functions.extend(right.core_module.functions.clone());
+
+    let body = Expr::Call(
+        (offset + right.function_index) as u64,
+        vec![Expr::Call(left.function_index as u64, vec![Expr::Argument(0)])],
+    );
+
+    let composed = Arrow {
+        input_type: left.input_type.clone(),
+        output_type: right.output_type.clone(),
+        core_module: CoreModule { functions },
+        function_index: offset + right.function_index,
+    };
+
+    if composed.core_module.functions.get(composed.function_index).is_none() {
+        return Err(GraphError::Unexpected("composed arrow out of range".to_string()));
+    }
+
+    let _ = body;
+    let mut module = composed.core_module.clone();
+    let function_index = module.functions.len();
+    module.functions.push(CoreFunction {
+        arity: 1,
+        body,
+    });
+    Ok(Arrow {
+        input_type: left.input_type.clone(),
+        output_type: right.output_type.clone(),
+        core_module: module.clone(),
+        function_index,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -550,8 +596,18 @@ pub struct Conflict {
     pub nodes: Vec<Digest>,
 }
 
+pub fn node_digest(node: &OpNode) -> Digest {
+    digest_bytes(&encode_value(&Value::Text(format!("{:?}", node))).unwrap_or_default())
+}
+
 pub fn frontier(history: &History) -> Vec<Digest> {
-    history.nodes.iter().map(|node| digest_bytes(&encode_value(&Value::Text(format!("{:?}", node))).unwrap_or_default())).collect()
+    let nodes: Vec<Digest> = history.nodes.iter().map(node_digest).collect();
+    let dependents: std::collections::HashSet<Digest> = history
+        .nodes
+        .iter()
+        .flat_map(|node| node.dependencies.iter().copied())
+        .collect();
+    nodes.into_iter().filter(|digest| !dependents.contains(digest)).collect()
 }
 
 pub fn materialize(history: &History, genesis: &Value, state: &Value) -> Materialization {
@@ -564,10 +620,26 @@ pub fn detect_conflict(history: &History) -> Option<Conflict> {
     if history.nodes.len() < 2 {
         return None;
     }
-    let nodes = history.nodes.iter().map(|node| {
-        digest_bytes(&encode_value(&Value::Text(format!("{:?}", node))).unwrap_or_default())
-    }).collect();
-    Some(Conflict { nodes })
+
+    let digests: Vec<Digest> = history.nodes.iter().map(node_digest).collect();
+    for (i, left) in history.nodes.iter().enumerate() {
+        for (j, right) in history.nodes.iter().enumerate().skip(i + 1) {
+            let left_digest = digests[i];
+            let right_digest = digests[j];
+            let left_dep = left.dependencies.iter().copied().collect::<std::collections::HashSet<_>>();
+            let right_dep = right.dependencies.iter().copied().collect::<std::collections::HashSet<_>>();
+            let ordered = left_dep.contains(&right_digest) || right_dep.contains(&left_digest);
+            if ordered {
+                continue;
+            }
+            let shared = left_dep.intersection(&right_dep).copied().collect::<Vec<_>>();
+            if (left_dep.is_empty() && right_dep.is_empty()) || !shared.is_empty() {
+                return Some(Conflict { nodes: vec![left_digest, right_digest] });
+            }
+        }
+    }
+
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1446,6 +1518,106 @@ mod tests {
         let closure = close(&graph, root).unwrap();
         assert_eq!(closure.len(), 3);
         assert_eq!(traverse(&graph, &closure, &[0, 1, 2]), Ok(Value::Nat(7)));
+    }
+
+    #[test]
+    fn composed_arrow_matches_functional_sequence() {
+        let left = Arrow {
+            input_type: TypeDescription::Nat,
+            output_type: TypeDescription::Nat,
+            core_module: CoreModule { functions: vec![CoreFunction {
+                arity: 1,
+                body: Expr::Primitive("nat_add".to_string(), vec![Expr::Argument(0), Expr::Literal(Value::Nat(1))]),
+            }] },
+            function_index: 0,
+        };
+        let right = Arrow {
+            input_type: TypeDescription::Nat,
+            output_type: TypeDescription::Nat,
+            core_module: CoreModule { functions: vec![CoreFunction {
+                arity: 1,
+                body: Expr::Primitive("nat_add".to_string(), vec![Expr::Argument(0), Expr::Literal(Value::Nat(2))]),
+            }] },
+            function_index: 0,
+        };
+
+        let composed = compose_arrow(&left, &right).unwrap();
+        let verdict = run_arrow(&composed, Value::Nat(5));
+        assert!(matches!(verdict.outcome, Outcome::Returned(Value::Nat(8))));
+    }
+
+    #[test]
+    fn language_lenses_round_trip_views() {
+        let lens = Lens {
+            source_type: TypeDescription::Nat,
+            view_type: TypeDescription::Nat,
+            get_arrow: Arrow {
+                input_type: TypeDescription::Nat,
+                output_type: TypeDescription::Nat,
+                core_module: CoreModule { functions: vec![CoreFunction {
+                    arity: 1,
+                    body: Expr::Primitive("nat_add".to_string(), vec![Expr::Argument(0), Expr::Literal(Value::Nat(1))]),
+                }] },
+                function_index: 0,
+            },
+            modify_arrow: Arrow {
+                input_type: TypeDescription::Product(vec![TypeDescription::Nat, TypeDescription::Nat]),
+                output_type: TypeDescription::Nat,
+                core_module: CoreModule { functions: vec![CoreFunction {
+                    arity: 1,
+                    body: Expr::Primitive("nat_add".to_string(), vec![Expr::Argument(0), Expr::Literal(Value::Nat(0))]),
+                }] },
+                function_index: 0,
+            },
+        };
+
+        let language = Language {
+            carrier_type: TypeDescription::Nat,
+            named_lenses: HashMap::from([("inc".to_string(), lens.clone())]),
+        };
+
+        let get = run_lens_get(&lens, Value::Nat(4));
+        assert!(matches!(get.outcome, Outcome::Returned(Value::Nat(5))));
+        assert_eq!(language.named_lenses["inc"].source_type, TypeDescription::Nat);
+    }
+
+    #[test]
+    fn history_frontier_excludes_transitively_depended_nodes() {
+        let base = digest_bytes(b"base");
+        let left = OpNode {
+            language_digest: digest_bytes(b"lang"),
+            operation_digest: digest_bytes(b"left"),
+            dependencies: vec![base],
+        };
+        let right = OpNode {
+            language_digest: digest_bytes(b"lang"),
+            operation_digest: digest_bytes(b"right"),
+            dependencies: vec![node_digest(&left)],
+        };
+        let history = History { nodes: vec![left.clone(), right.clone()] };
+        assert_eq!(frontier(&history), vec![node_digest(&right)]);
+    }
+
+    #[test]
+    fn history_conflict_requires_real_overlap() {
+        let base = digest_bytes(b"base");
+        let left = OpNode {
+            language_digest: digest_bytes(b"lang"),
+            operation_digest: digest_bytes(b"left"),
+            dependencies: vec![base],
+        };
+        let independent = OpNode {
+            language_digest: digest_bytes(b"lang"),
+            operation_digest: digest_bytes(b"right"),
+            dependencies: vec![digest_bytes(b"other")],
+        };
+        assert!(detect_conflict(&History { nodes: vec![left.clone(), independent.clone()] }).is_none());
+        let conflicting = OpNode {
+            language_digest: digest_bytes(b"lang"),
+            operation_digest: digest_bytes(b"right"),
+            dependencies: vec![base],
+        };
+        assert!(detect_conflict(&History { nodes: vec![left, conflicting] }).is_some());
     }
 
     #[test]
