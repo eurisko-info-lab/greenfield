@@ -103,6 +103,16 @@ impl CasStore {
     }
 }
 
+pub fn cas_put(bytes: &[u8]) -> Digest {
+    let mut store = CasStore::default();
+    store.put(bytes)
+}
+
+pub fn cas_get(digest: Digest) -> Option<Vec<u8>> {
+    let store = CasStore::default();
+    store.get(digest)
+}
+
 pub fn digest_bytes(bytes: &[u8]) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -568,5 +578,14 @@ mod tests {
     fn rejects_noncanonical_varint() {
         let encoded = [2u8, 0x80, 0x00];
         assert_eq!(decode_value(&encoded), Err(CanonError::NonCanonicalVarint));
+    }
+
+    #[test]
+    fn cas_put_and_get_are_content_addressed() {
+        let mut cas = CasStore::default();
+        let payload = b"hello stratum";
+        let digest = cas.put(payload);
+        assert_eq!(cas.get(digest), Some(payload.to_vec()));
+        assert_eq!(cas.get(digest_bytes(payload)), Some(payload.to_vec()));
     }
 }

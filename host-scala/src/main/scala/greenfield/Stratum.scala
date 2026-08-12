@@ -22,6 +22,26 @@ case class RefValue(digest: Array[Byte], typeDigest: Array[Byte]) extends Value
 
 case class CanonError(message: String)
 
+final class CasStore {
+  private val entries = scala.collection.mutable.HashMap.empty[Array[Byte], Array[Byte]]
+
+  def put(bytes: Array[Byte]): Array[Byte] = {
+    val digest = Stratum.digestBytes(bytes)
+    entries.update(digest, bytes.clone())
+    digest
+  }
+
+  def get(digest: Array[Byte]): Option[Array[Byte]] = entries.get(digest).map(_.clone)
+}
+
+object Cas {
+  private val store = new CasStore
+
+  def put(bytes: Array[Byte]): Array[Byte] = store.put(bytes)
+
+  def get(digest: Array[Byte]): Option[Array[Byte]] = store.get(digest)
+}
+
 object Stratum {
   private val MaxDepth = 64
 

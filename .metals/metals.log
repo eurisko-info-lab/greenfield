@@ -27,3 +27,9 @@
 2026.08.12 10:14:21 WARN  no build target for: /home/patrick/greenfield/host-scala/build.sbt[0m
 2026.08.12 10:14:21 INFO  no build target found for /home/patrick/greenfield/host-scala/build.sbt. Using presentation compiler with project's scala-library version: 3.6.3[0m
 2026.08.12 10:16:02 WARN  no build target for: /home/patrick/greenfield/host-scala/build.sbt[0m
+2026.08.12 10:17:27 INFO  compiling greenfield_a2f0c65cd7 (1 scala source)[0m
+2026.08.12 10:17:28 INFO  time: compiled greenfield_a2f0c65cd7 in 1.34s[0m
+2026.08.12 10:18:02 INFO  compiling greenfield_a2f0c65cd7 (1 scala source)[0m
+2026.08.12 10:18:02 INFO  time: compiled greenfield_a2f0c65cd7 in 0.55s[0m
+Aug 12, 2026 10:18:11 AM org.eclipse.lsp4j.jsonrpc.services.GenericEndpoint notify
+INFO: Unsupported notification method: $/setTrace
