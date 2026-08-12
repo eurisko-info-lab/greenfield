@@ -376,6 +376,16 @@ pub fn accel_register(implementation_digest: Digest, implementation: AccelHandle
     registry.insert(implementation_digest, implementation);
 }
 
+pub fn accel_unregister(implementation_digest: Digest) -> bool {
+    let mut registry = ACCEL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    registry.remove(&implementation_digest).is_some()
+}
+
+pub fn accel_clear() {
+    let mut registry = ACCEL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    registry.clear();
+}
+
 pub fn accel_run(manifest: &AccelManifest, input: Value, budget: Budget) -> Verdict {
     let registry = ACCEL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let implementation = registry.lock().unwrap().get(&manifest.implementation_digest).cloned();
@@ -1507,6 +1517,41 @@ mod tests {
         accel_register(manifest.implementation_digest, Arc::new(move |input, _budget| run_arrow(&registered_arrow, input)));
         let accelerated = accel_run(&manifest, Value::Nat(41), Budget { max_steps: 64, max_depth: 32, max_alloc: None });
         assert_eq!(observe(&generic), observe(&accelerated));
+    }
+
+    #[test]
+    fn uninstalling_accelerators_restores_generic_core_behavior() {
+        let module = CoreModule {
+            functions: vec![CoreFunction {
+                arity: 1,
+                body: Expr::Primitive("nat_add".to_string(), vec![Expr::Argument(0), Expr::Literal(Value::Nat(9))]),
+            }],
+        };
+        let arrow = Arrow {
+            input_type: TypeDescription::Nat,
+            output_type: TypeDescription::Nat,
+            core_module: module.clone(),
+            function_index: 0,
+        };
+        let manifest = AccelManifest {
+            semantic_arrow: arrow.clone(),
+            source_closure_digest: digest_bytes(b"src"),
+            target_kind: "nat".to_string(),
+            implementation_digest: digest_bytes(b"detach-test"),
+        };
+
+        let registered_arrow = arrow.clone();
+        let detach_arrow = registered_arrow.clone();
+        accel_register(manifest.implementation_digest, Arc::new(move |input, _budget| run_arrow(&detach_arrow, input)));
+        assert!(accel_unregister(manifest.implementation_digest));
+        let detached = accel_run(&manifest, Value::Nat(10), Budget { max_steps: 64, max_depth: 32, max_alloc: None });
+        assert!(matches!(detached.outcome, Outcome::Returned(Value::Nat(19))));
+
+        let clear_arrow = arrow.clone();
+        accel_register(manifest.implementation_digest, Arc::new(move |input, _budget| run_arrow(&clear_arrow, input)));
+        accel_clear();
+        let cleared = accel_run(&manifest, Value::Nat(10), Budget { max_steps: 64, max_depth: 32, max_alloc: None });
+        assert!(matches!(cleared.outcome, Outcome::Returned(Value::Nat(19))));
     }
 
     #[test]
